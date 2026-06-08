@@ -14,6 +14,7 @@ Usage:
 """
 
 import rospy
+import math
 import numpy as np
 import random
 import os
@@ -25,11 +26,11 @@ from std_msgs.msg import String
 from std_msgs.msg import Int32MultiArray
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from tf.transformations import euler_from_quaternion
 
-
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # MAZE LOADER
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 def load_grid(csv_path):
     grid = []
@@ -56,14 +57,14 @@ def load_config(json_path):
     return start_cell, goal_cell, goal_gz, resolution, offset_x, offset_y
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # GRIDWORLD
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 class GridWorld(object):
     # Class-level constants represent fixed cell types in the maze world.
     # Defined here rather than in __init__ because they are shared across
-    # all instances and never change — they describe the world, not an object.
+    # all instances and never change - they describe the world, not an object.
     FREE = 0.0
     GOAL = 1.0
     TRAP = -1.0
@@ -151,9 +152,9 @@ class GridWorld(object):
         print("")
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # Q-LEARNING AGENT
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 class QLearningAgent(object):
     def __init__(self, n_rows, n_cols,
@@ -229,9 +230,9 @@ class QLearningAgent(object):
         print("")
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # TRAINING (logical, no Gazebo)
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 def train_agent(env, agent, action_pub, state_pub, episodes=10000, max_steps=200):
     # ROS rate controls how fast training messages are published.
@@ -283,9 +284,9 @@ def train_agent(env, agent, action_pub, state_pub, episodes=10000, max_steps=200
     rospy.loginfo("Training finished")
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # GAZEBO TESTING
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 class GazeboTester(object):
     def __init__(self, agent, env, goal_gz, resolution, offset_x, offset_y):
@@ -294,19 +295,26 @@ class GazeboTester(object):
         self.goal_gz = goal_gz
         self.resolution = resolution
         self.current_gz = (0.0, 0.0)
+	self.current_yaw = 0.0
 	self.offset_x = offset_x
 	self.offset_y = offset_y
+
+	# Odometry is published by the Kobuki Gazebo plugin at ~100Hz.
+        # It gives the robot's current pose in the world frame, which we use
+        # to map back from Gazebo coordinates to a grid cell for Q-table lookup.
+	# Subscribe first so odom starts updating current_gz before we read spawn position
+        rospy.Subscriber('/odom', Odometry, self._odom_callback)
+	rospy.sleep(1.0)  # wait for first odom reading to arrive
+
+	# Capture actual spawn position to use as reference for gz_to_cell
+        self.spawn_x = self.current_gz[0]
+        self.spawn_y = self.current_gz[1]
 
         # cmd_vel_mux is the velocity multiplexer that routes commands through
         # the Kobuki safety layer (bumper stops, cliff detection).
         # Publishing here instead of directly to mobile_base/commands/velocity
         # ensures the robot respects its hardware safety constraints.
-        self.vel_pub = rospy.Publisher('/cmd_vel_mux/input/navi', Twist, queue_size=10)
-
-        # Odometry is published by the Kobuki Gazebo plugin at ~100Hz.
-        # It gives the robot's current pose in the world frame, which we use
-        # to map back from Gazebo coordinates to a grid cell for Q-table lookup.
-        rospy.Subscriber('/odom', Odometry, self._odom_callback)
+        self.vel_pub = rospy.Publisher('/cmd_vel_mux/input/navi', Twist, queue_size=10) 
 
     def _odom_callback(self, msg):
         # Extract only position; orientation is not needed for grid-cell mapping
@@ -314,50 +322,86 @@ class GazeboTester(object):
         y = msg.pose.pose.position.y
         self.current_gz = (x, y)
 
+	# Extract yaw (rotation around Z axis) from quaternion
+        q = msg.pose.pose.orientation
+        _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
+        self.current_yaw = yaw
+
     def gz_to_cell(self, x, y):
         """Convert Gazebo (x, y) back to grid (row, col).
         The world was offset so the start cell sits at Gazebo (0, 0),
         so we reverse that offset here to get the correct grid indices."""
-        col = int((x + self.offset_x) / self.resolution)
-	row = int(self.env.n_rows - 1 - (y + self.offset_y) / self.resolution)
+     	row = int(round(self.env.n_rows - 1 - (y - self.spawn_y + self.offset_y - self.resolution / 2.0) / self.resolution))
+	col = int(round((x - self.spawn_x + self.offset_x - self.resolution / 2.0) / self.resolution))
 	# Clamp to valid range to absorb small odometry drift
         row = max(0, min(self.env.n_rows - 1, row))
         col = max(0, min(self.env.n_cols - 1, col))
         return (row, col)
 
-    def move_to_cell(self, action, speed=0.2):
-        """Send a velocity command for exactly one cell and wait for arrival.
-        Duration = cell_size / speed ensures the robot travels one full cell
-        before stopping, keeping real position in sync with grid position."""
-        # Twist holds linear (x, y, z) and angular (x, y, z) velocities.
-        # For a ground robot only linear.x (forward/back) and linear.y (strafe)
-        # are used here since TurtleBot2 moves cell-to-cell axis-aligned.
-        twist = Twist()
-        if action == 0:    # UP    -> forward in Gazebo x-axis
-            twist.linear.x = speed
-        elif action == 1:  # RIGHT -> strafe negative y
-            twist.linear.y = -speed
-        elif action == 2:  # DOWN  -> backward in Gazebo x-axis
-            twist.linear.x = -speed
-        elif action == 3:  # LEFT  -> strafe positive y
-            twist.linear.y = speed
+    def move_to_cell(self, action, speed=0.2, angular_speed=1.0):
 
-        duration = self.resolution / speed
-        rate = rospy.Rate(10)
-        start = rospy.Time.now().to_sec()
+   	 # Target yaw for each action in Gazebo world frame.
+   	 # UP=0 means positive x direction, which is yaw=0 in ROS convention.
+    	target_yaws = {
+    		0: math.pi/2,   # UP    -> positive y (rows decrease = y increases in Gazebo)
+    		1: 0.0,         # RIGHT -> positive x
+    		2: -math.pi/2,  # DOWN  -> negative y
+    		3: math.pi      # LEFT  -> negative x
+	}
+    	target_yaw = target_yaws[action]
 
-        while rospy.Time.now().to_sec() - start < duration:
-            self.vel_pub.publish(twist)
-            rate.sleep()
+    	rate = rospy.Rate(10)
 
-        # Explicit stop after each cell move to prevent drift into the next cell
-        self.vel_pub.publish(Twist())
-        rospy.sleep(0.3)
+    	# --- ROTATE to face the correct direction ---
+    	while not rospy.is_shutdown():
+        	error = target_yaw - self.current_yaw
+
+        	# Normalize to [-pi, pi] so robot always takes shortest rotation path
+        	while error > math.pi:
+            		error -= 2 * math.pi
+        	while error < -math.pi:
+            		error += 2 * math.pi
+
+        	if abs(error) < 0.05:
+            		break
+
+        	twist = Twist()
+        	twist.angular.z = angular_speed if error > 0 else -angular_speed
+        	self.vel_pub.publish(twist)
+        	rate.sleep()
+
+		rospy.loginfo("yaw={} target={} error={}".format(
+   			 round(self.current_yaw, 3), round(target_yaw, 3), round(error, 3)))
+
+    	# Stop rotation before advancing
+    	self.vel_pub.publish(Twist())
+    	rospy.sleep(0.2)
+
+    	# --- ADVANCE exactly one cell ---
+    	duration = self.resolution / speed
+    	start = rospy.Time.now().to_sec()
+    	while rospy.Time.now().to_sec() - start < duration:
+        	twist = Twist()
+        	twist.linear.x = speed
+        	self.vel_pub.publish(twist)
+        	rate.sleep()
+
+    	# Stop and wait for physics to settle before next action
+    	self.vel_pub.publish(Twist())
+    	rospy.sleep(0.3)
+	rospy.loginfo("moved to gz=({},{})".format(
+	    round(self.current_gz[0],3), round(self.current_gz[1],3)))
 
     def run(self, max_steps=200):
         rospy.loginfo("Starting Gazebo test run")
         rate = rospy.Rate(2)
         steps = 0
+
+	rospy.loginfo("spawn=({},{}) offset=({},{})".format(
+		 self.spawn_x, self.spawn_y, self.offset_x, self.offset_y))
+	rospy.loginfo("current_gz={}".format(self.current_gz))
+	rospy.loginfo("gz_to_cell result={}".format(
+    		self.gz_to_cell(self.current_gz[0], self.current_gz[1])))
 
         while not rospy.is_shutdown() and steps < max_steps:
             state = self.gz_to_cell(self.current_gz[0], self.current_gz[1])
@@ -370,6 +414,7 @@ class GazeboTester(object):
             # Goal reached if robot is within 75% of a cell's width from the goal center
             x, y = self.current_gz
             dist = ((x - self.goal_gz[0])**2 + (y - self.goal_gz[1])**2) ** 0.5
+	    rospy.loginfo("pos=({},{}) goal_gz={} dist={}".format(round(x,3), round(y,3), self.goal_gz, round(dist,3)))
             if dist < self.resolution * 0.75:
                 rospy.loginfo("Goal reached!")
                 break
@@ -378,9 +423,9 @@ class GazeboTester(object):
             rate.sleep()
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # SAVE / LOAD
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 def save_q_table(agent, filename="q_table.npy"):
     np.save(filename, agent.q_table)
@@ -400,9 +445,9 @@ def load_q_table(agent, filename="q_table.npy"):
         rospy.logwarn("Q-table file not found: {}".format(filename))
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 # MAIN
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 
 def main():
     mode = '--train'
