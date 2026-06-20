@@ -26,6 +26,7 @@ from std_msgs.msg import String
 from std_msgs.msg import Int32MultiArray
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
 from tf.transformations import euler_from_quaternion
 
 # MAZE LOADER
@@ -346,6 +347,73 @@ class GazeboTester(object):
         self.last_visited_cell = None
         self.last_action = None
 
+	# LIDAR: raw scan storage, populated by _lidar_callback
+        self.lidar_ranges = []
+        self.lidar_angle_min = 0.0
+        self.lidar_angle_increment = 0.0
+        self.lidar_range_max = 12.0
+
+        rospy.Subscriber('/scan', LaserScan, self._lidar_callback)
+
+    def _lidar_callback(self, msg):
+        """Store raw LaserScan. Conversion happens in lidar_detect_obstacles()."""
+        self.lidar_ranges = list(msg.ranges)
+        self.lidar_angle_min = msg.angle_min
+        self.lidar_angle_increment = msg.angle_increment
+        self.lidar_range_max = msg.range_max
+ 
+    def lidar_detect_obstacles(self, current_state, fov_deg=30.0, max_range=0.6):
+        """
+        Detect unexpected obstacles using /scan (depthimage_to_laserscan / Kinect).
+        fov_deg  : total frontal field of view (30 deg = 15 each side of heading)
+        max_range: detection threshold in meters (0.6m ~ 1 cell at resolution=0.5)
+
+        Flow:
+          1. Filter rays within +-fov/2 of robot heading
+          2. Convert polar (r, theta) -> Cartesian absolute Gazebo coords
+          3. Convert Gazebo coords -> grid cell via gz_to_cell()
+          4. Skip static walls and already-known obstacles
+          5. Call trigger_replanning() for each new obstacle found
+        """
+        if not self.lidar_ranges:
+            return False
+
+        half_fov = math.radians(fov_deg / 2.0)
+        robot_x, robot_y = self.current_gz
+        new_obstacles_found = False
+
+        for i, r in enumerate(self.lidar_ranges):
+            # Skip invalid readings: inf, nan, zero, beyond threshold
+            if r <= 0.01 or r > max_range or math.isnan(r) or math.isinf(r):
+                continue
+
+            # Ray angle relative to robot forward axis (angle_min=0 means straight ahead)
+            ray_angle_robot = self.lidar_angle_min + i * self.lidar_angle_increment
+
+            # Keep only rays within the frontal FOV cone
+            if abs(ray_angle_robot) > half_fov:
+                continue
+
+            # Polar -> Cartesian in Gazebo world frame
+            angle_world = self.current_yaw + ray_angle_robot
+            obs_x = robot_x + r * math.cos(angle_world)
+            obs_y = robot_y + r * math.sin(angle_world)
+
+            # Gazebo coords -> grid cell
+            obs_cell = self.gz_to_cell(obs_x, obs_y)
+
+            # Skip own cell, static walls, and already registered obstacles
+            if obs_cell == current_state:
+                continue
+            if self.env.grid[obs_cell] == self.env.WALL:
+                continue
+            if obs_cell in self.env.dynamic_obstacles:
+                continue
+
+            # New unexpected obstacle
+            rospy.logwarn("[LIDAR] Obstacle detected at cell {} gz=({},{})".format(obs_cell, round(obs_x, 3), round(obs_y, 3)))
+	    self.env.dynamic_obstacles.add(obs_cell)
+
     def _odom_callback(self, msg):
         x = msg.pose.pose.position.x
         y = msg.pose.pose.position.y
@@ -510,39 +578,6 @@ class GazeboTester(object):
             # --- BUG FIX: Global wall safety filter checked on every single regular iteration step ---
             intended_action = self.evaluate_evasion_strategy(current_state)
 
-	    # DEMO ONLY
-	    if (3,4) == current_state and (3,5) not in self.env.dynamic_obstacles:
-    		rospy.logwarn("[DEMO] Injecting obstacle at (3,5)")
-    		self.env.dynamic_obstacles.add((3,5))
-
-	    if (4,4) == current_state and (4,5) not in self.env.dynamic_obstacles:
-    		rospy.logwarn("[DEMO] Injecting obstacle at (4,5)")
-    		self.env.dynamic_obstacles.add((4,5))
-
-	    if (5,4) == current_state and (5,5) not in self.env.dynamic_obstacles:
-    		rospy.logwarn("[DEMO] Injecting obstacle at (5,5)")
-    		self.env.dynamic_obstacles.add((5,5))
-
-	    if (7,8) == current_state and (8,8) not in self.env.dynamic_obstacles:
-    		rospy.logwarn("[DEMO] Injecting obstacle at (8,8)")
-    		self.env.dynamic_obstacles.add((8,8))
-
-	    if (7,7) == current_state and (8,7) not in self.env.dynamic_obstacles:
-    		rospy.logwarn("[DEMO] Injecting obstacle at (8,7)")
-    		self.env.dynamic_obstacles.add((8,7))
-
-	    if (6,8) == current_state and (7,8) not in self.env.dynamic_obstacles:
-    		rospy.logwarn("[DEMO] Injecting obstacle at (7,8)")
-    		self.env.dynamic_obstacles.add((7,8))
-
-	    if (5,8) == current_state and (6,8) not in self.env.dynamic_obstacles:
-    		rospy.logwarn("[DEMO] Injecting obstacle at (6,8)")
-    		self.env.dynamic_obstacles.add((6,8))
-
-	    if (4,8) == current_state and (5,8) not in self.env.dynamic_obstacles:
-    		rospy.logwarn("[DEMO] Injecting obstacle at (5,8)")
-    		self.env.dynamic_obstacles.add((5,8))
-
             # ROTATIONAL ORIENTATION ALIGNMENT before moving forward
             target_yaws = {0: math.pi/2, 1: 0.0, 2: -math.pi/2, 3: math.pi}
             target_yaw = target_yaws[intended_action]
@@ -563,7 +598,12 @@ class GazeboTester(object):
 
             rospy.sleep(0.1)
 
-            # POST-ROTATION ADVANCE CLEARANCE CHECKING
+            # LIDAR: scan for unexpected obstacles in 30-degree frontal cone
+            # Runs every iteration before choosing action, so replanning happens
+            # before the robot commits to moving into a dangerous cell
+            self.lidar_detect_obstacles(current_state)
+
+	    # POST-ROTATION ADVANCE CLEARANCE CHECKING
 	    obstacle_detected, obstacle_cell = (self.detect_obstacle_ahead(current_state, intended_action))
 
 	    if obstacle_detected:
