@@ -88,21 +88,40 @@ class GridWorld(object):
     def get_next_state(self, state, action):
         row, col = state
 
-        if action == 0:    # UP
-            row = max(0, row - 1)
-        elif action == 1:  # RIGHT
-            col = min(self.n_cols - 1, col + 1)
-        elif action == 2:  # DOWN
-            row = min(self.n_rows - 1, row + 1)
-        elif action == 3:  # LEFT
-            col = max(0, col - 1)
+        # Moore neighborhood, indices clockwise from north. Even indices are the
+        # cardinal moves, odd indices are the diagonals.
+        # 0=N 1=NE 2=E 3=SE 4=S 5=SW 6=W 7=NW
+        deltas = {
+            0: (-1,  0),  # N
+            1: (-1,  1),  # NE
+            2: ( 0,  1),  # E
+            3: ( 1,  1),  # SE
+            4: ( 1,  0),  # S
+            5: ( 1, -1),  # SW
+            6: ( 0, -1),  # W
+            7: (-1, -1),  # NW
+        }
+        dr, dc = deltas[action]
+        nrow = max(0, min(self.n_rows - 1, row + dr))
+        ncol = max(0, min(self.n_cols - 1, col + dc))
+        candidate = (nrow, ncol)
 
-        candidate = (row, col)
+        # For a diagonal move the robot physically cuts the corner between the two
+        # orthogonal cells it passes by. Because the robot has real width, block the
+        # diagonal if EITHER of those orthogonal cells is a wall or obstacle, so it
+        # never clips a corner. The diagonal is only allowed when both sides are clear.
+        if dr != 0 and dc != 0:
+            side_a = (row + dr, col)       # vertical neighbor
+            side_b = (row, col + dc)       # horizontal neighbor
+            for side in (side_a, side_b):
+                if 0 <= side[0] < self.n_rows and 0 <= side[1] < self.n_cols:
+                    if self.grid[side] == self.WALL or side in self.dynamic_obstacles:
+                        return state
 
         if self.grid[candidate] == self.WALL:
             return state
 
-	if candidate in self.dynamic_obstacles:
+        if candidate in self.dynamic_obstacles:
             return state
 
         return candidate
@@ -113,7 +132,9 @@ class GridWorld(object):
         if next_state == self.state:
             return self.state, -20, False
 
-        reward = -5
+        # Diagonal moves (4-7) cover more ground (~1.41x) so they cost a bit more,
+        # making the agent prefer them only when they actually shorten the path.
+        reward = -7 if action % 2 == 1 else -5
         cell_value = self.grid[next_state]
 
         if cell_value == self.GOAL:
@@ -131,20 +152,20 @@ class GridWorld(object):
     def get_candidate_state(self, state, action):
 
     	row, col = state
-
-    	if action == 0:
-            row = max(0, row - 1)
-
-    	elif action == 1:
-            col = min(self.n_cols - 1, col + 1)
-
-    	elif action == 2:
-            row = min(self.n_rows - 1, row + 1)
-
-    	elif action == 3:
-            col = max(0, col - 1)
-
-    	return (row, col)
+    	deltas = {
+            0: (-1,  0),  # N
+            1: (-1,  1),  # NE
+            2: ( 0,  1),  # E
+            3: ( 1,  1),  # SE
+            4: ( 1,  0),  # S
+            5: ( 1, -1),  # SW
+            6: ( 0, -1),  # W
+            7: (-1, -1),  # NW
+        }
+    	dr, dc = deltas[action]
+    	nrow = max(0, min(self.n_rows - 1, row + dr))
+    	ncol = max(0, min(self.n_cols - 1, col + dc))
+    	return (nrow, ncol)
 
     def get_reward(self, state, action, next_state):
 
@@ -156,7 +177,7 @@ class GridWorld(object):
 
             return -20
 
-    	reward = -5
+    	reward = -7 if action % 2 == 1 else -5
 
     	if self.grid[next_state] == self.GOAL:
             reward += 100
@@ -198,11 +219,11 @@ class QLearningAgent(object):
         self.exploration_rate = exploration_rate
         self.min_exploration_rate = min_exploration_rate
         self.exploration_decay = exploration_decay
-        self.q_table = np.zeros((n_rows, n_cols, 4), dtype=float)
+        self.q_table = np.zeros((n_rows, n_cols, 8), dtype=float)
 
     def choose_action(self, state):
         if random.uniform(0, 1) < self.exploration_rate:
-            return random.randint(0, 3)
+            return random.randint(0, 7)
         q_values = self.q_table[state]
         max_q = np.max(q_values)
         best_actions = np.where(q_values == max_q)[0]
@@ -245,7 +266,7 @@ class QLearningAgent(object):
                     if env.grid[state] == env.WALL:
                     	continue
 
-                    for action in range(4):
+                    for action in range(8):
 
                     	next_state = env.get_next_state(state, action)
 
@@ -260,21 +281,24 @@ class QLearningAgent(object):
             self.q_table = new_q
 
     def print_policy(self, env):
-        arrows = ['^', '>', 'v', '<']
+        # Clockwise from north, one distinct arrow per direction:
+        # 0=N 1=NE 2=E 3=SE 4=S 5=SW 6=W 7=NW
+        arrows = [u'\u2191', u'\u2197', u'\u2192', u'\u2198',
+                  u'\u2193', u'\u2199', u'\u2190', u'\u2196']
         print("\nPOLICY\n")
         for i in range(self.n_rows):
-            row = ""
+            row = u""
             for j in range(self.n_cols):
                 if (i, j) == env.goal_cell:
-                    row += " G "
+                    row += u" G "
                 elif env.grid[i, j] == GridWorld.TRAP:
-                    row += " T "
+                    row += u" T "
                 elif env.grid[i, j] == GridWorld.WALL:
-                    row += " W "
+                    row += u" W "
                 else:
                     best = np.argmax(self.q_table[i, j])
-                    row += " " + arrows[best] + " "
-            print(row)
+                    row += u" " + arrows[best] + u" "
+            print(row.encode('utf-8'))
         print("")
 
 
@@ -341,10 +365,14 @@ class GazeboTester(object):
         self.vel_pub = rospy.Publisher('/cmd_vel_mux/input/navi', Twist, queue_size=10)
 
         self.MOVEMENTS = {
-            0: (-1,  0),  # UP (North)
-            1: ( 0,  1),  # RIGHT (East)
-            2: ( 1,  0),  # DOWN (South)
-            3: ( 0, -1)   # LEFT (West)
+            0: (-1,  0),  # N  (North)
+            1: (-1,  1),  # NE (North-East)
+            2: ( 0,  1),  # E  (East)
+            3: ( 1,  1),  # SE (South-East)
+            4: ( 1,  0),  # S  (South)
+            5: ( 1, -1),  # SW (South-West)
+            6: ( 0, -1),  # W  (West)
+            7: (-1, -1)   # NW (North-West)
         }
 
         self.last_visited_cell = None
@@ -371,7 +399,7 @@ class GazeboTester(object):
         y = self.spawn_y - self.offset_y + (self.resolution / 2.0) + ((self.env.n_rows - 1 - row) * self.resolution)
         return x, y
 
-    def _scan_current_view(self, current_state, fov_deg=30.0, max_range=1.1):
+    def _scan_current_view(self, current_state, fov_deg=20.0, max_range=1.1):
         """
         Scan the narrow frontal cone at the robot current heading and return the set
         of new obstacle cells found. Does NOT replan; callers decide what to do with
@@ -560,7 +588,7 @@ class GazeboTester(object):
     	best_action = None
     	best_q = -float('inf')
 
-    	for action in range(4):
+    	for action in range(8):
 
             dr, dc = self.MOVEMENTS[action]
 
@@ -598,8 +626,19 @@ class GazeboTester(object):
 
     	obstacle_cell = (current_state[0] + dr, current_state[1] + dc)
 
+    	# Destination cell blocked
     	if obstacle_cell in self.env.dynamic_obstacles:
             return True, obstacle_cell
+
+    	# For a diagonal move, also block if either orthogonal corner cell is occupied,
+    	# since the robot would clip that corner on the way through. Report the corner
+    	# as the obstacle so the planner avoids the diagonal.
+    	if dr != 0 and dc != 0:
+            corner_a = (current_state[0] + dr, current_state[1])
+            corner_b = (current_state[0], current_state[1] + dc)
+            for corner in (corner_a, corner_b):
+                if corner in self.env.dynamic_obstacles:
+                    return True, corner
 
     	return False, None
 
@@ -627,7 +666,10 @@ class GazeboTester(object):
 
         rospy.logwarn("[REPLAN] Dynamic obstacles: {}".format(sorted(obstacle_cells)))
 
-        movements = {0: (-1, 0), 1: (0, 1), 2: (1, 0), 3: (0, -1)}
+        movements = {
+            0: (-1,  0), 1: (-1,  1), 2: ( 0,  1), 3: ( 1,  1),
+            4: ( 1,  0), 5: ( 1, -1), 6: ( 0, -1), 7: (-1, -1)
+        }
 
         for obstacle_cell in obstacle_cells:
             self.env.dynamic_obstacles.add(obstacle_cell)
@@ -707,7 +749,7 @@ class GazeboTester(object):
         return True
 
     def move_to_cell(self, action, speed=0.2, angular_speed=1.0):
-        target_yaws = {0: math.pi/2, 1: 0.0, 2: -math.pi/2, 3: math.pi}
+        target_yaws = {0: math.pi/2, 1: math.pi/4, 2: 0.0, 3: -math.pi/4, 4: -math.pi/2, 5: -3*math.pi/4, 6: math.pi, 7: 3*math.pi/4}
         target_yaw = target_yaws[action]
         rate = rospy.Rate(10)
 
@@ -740,9 +782,35 @@ class GazeboTester(object):
         rospy.loginfo("[CONTROL] Target cell coordinate set to Row: {}, Col: {} -> GZ: x={}, y={}".format(
             target_row, target_col, round(target_x,3), round(target_y,3)))
 
+        # Check whether the target cell sits next to a static wall or a dynamic
+        # obstacle. If so, approach more slowly and brake precisely at the center, so
+        # the robot does not overshoot and push into the adjacent wall or box.
+        near_wall = False
+        for (wr, wc) in ((target_row-1, target_col), (target_row+1, target_col),
+                         (target_row, target_col-1), (target_row, target_col+1)):
+            if 0 <= wr < self.env.n_rows and 0 <= wc < self.env.n_cols:
+                if self.env.grid[(wr, wc)] == self.env.WALL or (wr, wc) in self.env.dynamic_obstacles:
+                    near_wall = True
+                    break
+
+        approach_speed = 0.12 if near_wall else speed
+        arrival_tol = 0.04
+
+        # Unit vector pointing from the start toward the target, used to detect when
+        # the robot has passed the center (overshoot) so it can stop immediately.
+        start_x, start_y = self.current_gz
+        path_dx = target_x - start_x
+        path_dy = target_y - start_y
+        path_len = math.sqrt(path_dx**2 + path_dy**2)
+        if path_len > 1e-6:
+            path_ux, path_uy = path_dx / path_len, path_dy / path_len
+        else:
+            path_ux, path_uy = 0.0, 0.0
+
         move_start = rospy.Time.now()
+        move_timeout = 10.0 if action % 2 == 1 else 8.0
 	while not rospy.is_shutdown():
-	    if (rospy.Time.now() - move_start).to_sec() > 8.0:
+	    if (rospy.Time.now() - move_start).to_sec() > move_timeout:
                 rospy.logwarn("[MOVE] Timeout reaching target cell, aborting move")
                 break
 
@@ -750,13 +818,22 @@ class GazeboTester(object):
             error_y = target_y - self.current_gz[1]
             distance_error = math.sqrt(error_x**2 + error_y**2)
 
-            if distance_error < 0.04:
+            if distance_error < arrival_tol:
                 break
 
-            kp_linear = 1.2
+            # Anti-overshoot: if the remaining error vector now points opposite to the
+            # travel direction, the robot has passed the cell center. Stop right away
+            # instead of pushing further (which would drive it into a nearby wall).
+            along = error_x * path_ux + error_y * path_uy
+            if along < 0:
+                break
+
+            # Proportional speed that eases off near the target. Lower gain when close
+            # to a wall so the approach is gentle and does not overshoot.
+            kp_linear = 0.9 if near_wall else 1.2
             twist = Twist()
             raw_linear_speed = kp_linear * distance_error
-            twist.linear.x = max(min(raw_linear_speed, speed), 0.02)
+            twist.linear.x = max(min(raw_linear_speed, approach_speed), 0.0)
 
             yaw_error = target_yaw - self.current_yaw
             yaw_error = math.atan2(math.sin(yaw_error), math.cos(yaw_error))
@@ -803,7 +880,7 @@ class GazeboTester(object):
             # but are visible from a diagonal ~0.7m away. If the sweep finds something
             # new, it replans and we restart the loop to pick the best action on the
             # updated map.
-            target_yaws = {0: math.pi/2, 1: 0.0, 2: -math.pi/2, 3: math.pi}
+            target_yaws = {0: math.pi/2, 1: math.pi/4, 2: 0.0, 3: -math.pi/4, 4: -math.pi/2, 5: -3*math.pi/4, 6: math.pi, 7: 3*math.pi/4}
             target_yaw = target_yaws[intended_action]
 
             if self.sweep_scan(current_state, self.current_yaw, target_yaw):
@@ -825,7 +902,9 @@ class GazeboTester(object):
             # INITIATE KINEMATIC DISPLACEMENT CONTROL
             self.last_visited_cell = current_state
             self.last_action = intended_action
-            rospy.loginfo("Cell {} -> selected action {}".format(current_state, intended_action))
+            dir_names = {0:"N", 1:"NE", 2:"E", 3:"SE", 4:"S", 5:"SW", 6:"W", 7:"NW"}
+            rospy.loginfo("Cell {} -> selected action {} ({})".format(
+                current_state, intended_action, dir_names.get(intended_action, "?")))
             self.move_to_cell(intended_action)
 
             # SLIDING WINDOW LOOP BACKUP DETECTION METHOD
