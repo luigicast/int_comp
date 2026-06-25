@@ -378,6 +378,8 @@ class GazeboTester(object):
         self.last_visited_cell = None
         self.last_action = None
 
+	self.use_sweep = True
+
         # LIDAR: PointCloud2 from Kinect depth camera, populated by _lidar_callback
 	self.point_cloud_points = []
 	rospy.Subscriber('/camera/depth/points', PointCloud2, self._lidar_callback)
@@ -883,13 +885,23 @@ class GazeboTester(object):
             target_yaws = {0: math.pi/2, 1: math.pi/4, 2: 0.0, 3: -math.pi/4, 4: -math.pi/2, 5: -3*math.pi/4, 6: math.pi, 7: 3*math.pi/4}
             target_yaw = target_yaws[intended_action]
 
-            if self.sweep_scan(current_state, self.current_yaw, target_yaw):
-                continue
+	    if self.use_sweep:
+		# Active perception: sweep the arc to the chosen heading, scanning
+                # the diagonals on the way. Replan once if anything new is found.
+	    	if self.sweep_scan(current_state, self.current_yaw, target_yaw):
+                    continue
 
-            # After the sweep the robot may not be exactly at target_yaw, so do a final
-            # precise alignment before moving forward.
-            self._rotate_to_yaw(target_yaw)
-            rospy.sleep(0.1)
+            	# After the sweep the robot may not be exactly at target_yaw, so do a final
+            	# precise alignment before moving forward.
+            	self._rotate_to_yaw(target_yaw)
+            	rospy.sleep(0.1)
+
+	    else:
+                # No sweep: just rotate to the action heading and scan once there.
+                self._rotate_to_yaw(target_yaw)
+                rospy.sleep(0.1)
+                if self.lidar_detect_obstacles(current_state, intended_action):
+                    continue
 
             # POST-ROTATION ADVANCE CLEARANCE CHECKING
             # Only replans if the sweep didn't already catch this obstacle
