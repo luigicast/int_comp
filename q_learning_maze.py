@@ -356,6 +356,11 @@ class GazeboTester(object):
 	self.replanned_obstacles = set()
 	self.visit_counts = {}
 
+        # Trajectory recording: sampled position over time for plotting
+        self.trajectory = []          # list of (sim_time, x, y)
+        self._traj_dt = 0.2           # seconds between samples
+        self._traj_last_t = 0.0
+
         rospy.Subscriber('/odom', Odometry, self._odom_callback)
         rospy.sleep(1.0)
 
@@ -378,7 +383,7 @@ class GazeboTester(object):
         self.last_visited_cell = None
         self.last_action = None
 
-	self.use_sweep = True
+        self.use_sweep = True
 
         # LIDAR: PointCloud2 from Kinect depth camera, populated by _lidar_callback
 	self.point_cloud_points = []
@@ -576,6 +581,14 @@ class GazeboTester(object):
         _, _, yaw = euler_from_quaternion([q.x, q.y, q.z, q.w])
         self.current_yaw = yaw
 
+        # Record the full trajectory at a fixed time interval, so the path can be
+        # plotted smoothly later (not just one point per cell). Each entry is the
+        # simulation time and the Gazebo position.
+        now = rospy.get_time()
+        if now - self._traj_last_t >= self._traj_dt:
+            self._traj_last_t = now
+            self.trajectory.append((now, x, y))
+
     def gz_to_cell(self, x, y):
         row = int(round(self.env.n_rows - 1 - (y - self.spawn_y + self.offset_y - self.resolution / 2.0) / self.resolution))
         col = int(round((x - self.spawn_x + self.offset_x - self.resolution / 2.0) / self.resolution))
@@ -687,11 +700,14 @@ class GazeboTester(object):
         # Global value iteration over the whole grid. Centered on the goal with a
         # radius large enough to cover every cell, so all known obstacle costs
         # propagate back from the goal and the resulting route is globally optimal
-        # for the obstacles discovered so far.
+        # for the obstacles discovered so far. Timed with the real wall clock to
+        # report the pure compute cost of the replan in milliseconds.
         full_radius = self.env.n_rows + self.env.n_cols
+        vi_start = time.time()
         self.agent.local_value_iteration(env=self.env, center=self.env.goal_cell,
                                          radius=full_radius, iterations=300)
-        rospy.logwarn("[REPLAN] Global value iteration completed")
+        vi_ms = (time.time() - vi_start) * 1000.0
+        rospy.logwarn("[REPLAN] Global value iteration completed in {:.1f} ms".format(vi_ms))
 
 
     def _rotate_to_yaw(self, target_yaw):
@@ -885,18 +901,18 @@ class GazeboTester(object):
             target_yaws = {0: math.pi/2, 1: math.pi/4, 2: 0.0, 3: -math.pi/4, 4: -math.pi/2, 5: -3*math.pi/4, 6: math.pi, 7: 3*math.pi/4}
             target_yaw = target_yaws[intended_action]
 
-	    if self.use_sweep:
-		# Active perception: sweep the arc to the chosen heading, scanning
+            if self.use_sweep:
+                # Active perception: sweep the arc to the chosen heading, scanning
                 # the diagonals on the way. Replan once if anything new is found.
-	    	if self.sweep_scan(current_state, self.current_yaw, target_yaw):
+                if self.sweep_scan(current_state, self.current_yaw, target_yaw):
                     continue
 
-            	# After the sweep the robot may not be exactly at target_yaw, so do a final
-            	# precise alignment before moving forward.
-            	self._rotate_to_yaw(target_yaw)
-            	rospy.sleep(0.1)
+                # After the sweep the robot may not be exactly at target_yaw, so do a
+                # final precise alignment before moving forward.
+                self._rotate_to_yaw(target_yaw)
+                rospy.sleep(0.1)
 
-	    else:
+            else:
                 # No sweep: just rotate to the action heading and scan once there.
                 self._rotate_to_yaw(target_yaw)
                 rospy.sleep(0.1)
@@ -933,6 +949,24 @@ class GazeboTester(object):
 
             steps += 1
             rate.sleep()
+
+        # Dump the recorded trajectory to a CSV file so it can be plotted later.
+        self.save_trajectory()
+
+    def save_trajectory(self):
+        """Write the recorded trajectory to a CSV. The path is taken from the
+        TRAJECTORY_FILE environment variable if set (so the batch runner can give
+        each run its own file), otherwise a default name is used."""
+        out_path = os.environ.get('TRAJECTORY_FILE', 'trajectory.csv')
+        try:
+            with open(out_path, 'w') as f:
+                f.write("sim_time,x,y\n")
+                for (t, x, y) in self.trajectory:
+                    f.write("{:.3f},{:.4f},{:.4f}\n".format(t, x, y))
+            rospy.loginfo("[TRAJ] Trajectory ({} points) saved to {}".format(
+                len(self.trajectory), out_path))
+        except Exception as e:
+            rospy.logwarn("[TRAJ] Could not save trajectory: {}".format(e))
 
 
 # SAVE / LOAD
