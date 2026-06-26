@@ -267,8 +267,17 @@ def write_csv(data, present_groups):
 
 # ---- Plots --------------------------------------------------------------
 def _gz_to_plot(pts, h, ox, oy, res):
-    cols = [(x + ox) / res for (x, y) in pts]
-    rows = [h - ((y + oy) / res) for (x, y) in pts]
+    """Convert Gazebo (x, y) to plot (col, row) coordinates aligned with the maze
+    drawn by imshow(origin='upper', extent=[0,w,0,h]). Mirrors the robot's own
+    gz_to_cell mapping (spawn at 0) and places points like the policy plot does,
+    so trajectories and policy share the same orientation (the row axis was
+    previously flipped, drawing paths upside down)."""
+    cols, rows = [], []
+    for (x, y) in pts:
+        col_frac = (x + ox - res / 2.0) / res
+        row_frac = (h - 1) - (y + oy - res / 2.0) / res
+        cols.append(col_frac + 0.5)
+        rows.append(h - row_frac - 0.5)
     return cols, rows
 
 
@@ -339,17 +348,24 @@ def plot_trajectories(data, walls, meta, present_groups):
     if not os.path.exists(indiv_dir):
         os.makedirs(indiv_dir)
 
+    # Distinct colors so the 10 individual runs are visible even when they nearly
+    # overlap (the robot follows almost the same route every time).
+    cmap = plt.get_cmap('tab10')
+
     for g in present_groups:
         runs = [r for r in data[g] if r['traj']]
         if not runs:
             continue
-        fig, ax = plt.subplots(figsize=(7, 7))
-        ax.imshow(walls, cmap='Greys', origin='upper',
-                  extent=[0, w, 0, h], alpha=0.85, aspect='equal')
+        obstacles = load_obstacle_cells(g) or []
+
+        fig, ax = plt.subplots(figsize=(7.5, 7.5))
+        _draw_maze_background(ax, walls, obstacles, start, goal, h, w)
+
         converted = []
-        for r in runs:
+        for idx, r in enumerate(runs):
             cols, rows = _gz_to_plot(r['traj'], h, ox, oy, res)
-            ax.plot(cols, rows, color='#3b7dd8', alpha=0.30, linewidth=1.5)
+            ax.plot(cols, rows, color=cmap(idx % 10), alpha=0.8, linewidth=1.6,
+                    label='run {:02d}'.format(idx + 1))
             converted.append((cols, rows))
         L = min(len(c) for c, _ in converted)
         if L >= 2:
@@ -357,19 +373,18 @@ def plot_trajectories(data, walls, meta, present_groups):
                           for c, _ in converted], axis=0)
             mr = np.mean([np.interp(np.linspace(0, 1, L), np.linspace(0, 1, len(rw)), rw)
                           for _, rw in converted], axis=0)
-            ax.plot(mc, mr, color='#d81e1e', linewidth=3, label='Mean path')
+            ax.plot(mc, mr, color='black', linewidth=3.5, label='Mean path', zorder=10)
         ax.set_xlim(0, w); ax.set_ylim(0, h)
         ax.set_title('{} - {} ({} runs)'.format(MAZE_NAME, GROUP_LABEL[g], len(runs)))
-        ax.legend(loc='upper right')
+        ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=7)
         ax.set_xlabel('column'); ax.set_ylabel('row')
         fig.tight_layout()
         p = os.path.join(OUT_DIR, 'trajectories_{}_{}.png'.format(MAZE_NAME, g))
         fig.savefig(p, dpi=130); plt.close(fig); print("Wrote {}".format(p))
 
         for i, r in enumerate(runs, 1):
-            fig, ax = plt.subplots(figsize=(6, 6))
-            ax.imshow(walls, cmap='Greys', origin='upper',
-                      extent=[0, w, 0, h], alpha=0.85, aspect='equal')
+            fig, ax = plt.subplots(figsize=(6.5, 6.5))
+            _draw_maze_background(ax, walls, obstacles, start, goal, h, w)
             cols, rows = _gz_to_plot(r['traj'], h, ox, oy, res)
             color = '#1e8c3a' if r['success'] else '#d81e1e'
             ax.plot(cols, rows, color=color, linewidth=2)
@@ -385,6 +400,36 @@ def plot_trajectories(data, walls, meta, present_groups):
             p = os.path.join(indiv_dir, '{}_{}_run{:02d}.png'.format(MAZE_NAME, g, i))
             fig.savefig(p, dpi=110); plt.close(fig)
         print("Wrote {} individual plots for {}".format(len(runs), g))
+
+
+def _draw_maze_background(ax, walls, obstacles, start, goal, h, w):
+    """Draw the maze: static walls (grey), a cell grid, dynamic obstacles (orange),
+    and the start/goal markers. Shared by overlay and individual trajectory plots."""
+    # Static walls
+    ax.imshow(walls, cmap='Greys', origin='upper',
+              extent=[0, w, 0, h], alpha=0.85, aspect='equal')
+
+    # Dynamic obstacles as orange squares (one per cell)
+    for (r, c) in obstacles:
+        ax.add_patch(plt.Rectangle((c, h - r - 1), 1, 1,
+                                   facecolor='#e8821e', edgecolor='#a35a10',
+                                   alpha=0.9, zorder=3))
+
+    # Cell grid lines
+    for x in range(w + 1):
+        ax.axvline(x, color='#b0b0b0', linewidth=0.5, alpha=0.6, zorder=1)
+    for y in range(h + 1):
+        ax.axhline(y, color='#b0b0b0', linewidth=0.5, alpha=0.6, zorder=1)
+
+    # Start (S) and goal (G) markers
+    if start:
+        sr, sc = start
+        ax.text(sc + 0.5, h - sr - 0.5, 'S', ha='center', va='center',
+                fontsize=13, fontweight='bold', color='#d81e1e', zorder=5)
+    if goal:
+        gr, gc = goal
+        ax.text(gc + 0.5, h - gr - 0.5, 'G', ha='center', va='center',
+                fontsize=13, fontweight='bold', color='#1e8c3a', zorder=5)
 
 
 def plot_base_policy(walls, meta):
