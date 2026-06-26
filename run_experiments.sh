@@ -78,7 +78,7 @@ $(python -c "
 import json
 d = json.load(open('$META_JSON'))
 s = d['start']['cell']; g = d['goal']['cell']
-print(s[0], s[1], g[0], g[1])
+print('%d %d %d %d' % (s[0], s[1], g[0], g[1]))
 ")
 EOF
 
@@ -87,15 +87,19 @@ GOAL="$GOAL_ROW $GOAL_COL"
 echo "Maze $MAZE_NAME : start ($START)  goal ($GOAL)"
 
 # ---- Build the list of groups to run ------------------------------------
-GROUPS="0obs 1obs"
+OBS_GROUPS="0obs 1obs"
 if [ "$MAX_OBS" = "2" ]; then
-    GROUPS="0obs 1obs 2obs"
+    OBS_GROUPS="0obs 1obs 2obs"
 fi
 
 # ---- Helpers ------------------------------------------------------------
 kill_gazebo() {
-    killall -9 gzserver gzclient roslaunch >/dev/null 2>&1
-    sleep 2
+    # Kill Gazebo, the ROS stack, and any stale tester process from a previous
+    # run. Without killing the tester, a leftover python process can receive the
+    # next shutdown and corrupt the following run's log.
+    killall -9 gzserver gzclient roslaunch rosmaster roscore >/dev/null 2>&1
+    pkill -9 -f "q_learning_maze.py" >/dev/null 2>&1
+    sleep 4
 }
 
 launch_gazebo() {
@@ -125,7 +129,7 @@ echo "$TRAIN_SECONDS" > "$META_DIR/training_seconds.txt"
 echo "Training took $TRAIN_SECONDS s (saved to training_seconds.txt)"
 
 # ---- Main loop ----------------------------------------------------------
-for group in $GROUPS; do
+for group in $OBS_GROUPS; do
     json="$(obstacle_json_for "$group")"
     echo "=============================================================="
     echo "GROUP $group   maze=$MAZE_NAME"
@@ -158,6 +162,10 @@ for group in $GROUPS; do
 
         timeout "$RUN_TIMEOUT" python "$TESTER" --test --maze "$MAZE" > "$log" 2>&1
         echo "    done (exit $?)"
+
+        # Tear down this run's Gazebo/ROS before the next iteration so processes
+        # never overlap (overlap corrupts the next run's log and causes hangs).
+        kill_gazebo
     done
 done
 

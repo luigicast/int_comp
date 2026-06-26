@@ -1028,6 +1028,10 @@ def main():
         tester = GazeboTester(agent, env, goal_gz, resolution, offset_x, offset_y)
         tester.run()
 
+        # Shut down the ROS node cleanly so this process exits and does not
+        # linger to interfere with the next run in a batch.
+        rospy.signal_shutdown("run complete")
+
 
 if __name__ == '__main__':
     main()

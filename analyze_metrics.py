@@ -387,6 +387,63 @@ def plot_trajectories(data, walls, meta, present_groups):
         print("Wrote {} individual plots for {}".format(len(runs), g))
 
 
+def plot_base_policy(walls, meta):
+    """Draw the trained base policy (no dynamic obstacles) as arrows over the
+    maze. Reads the saved Q-table .npy for this maze. One arrow per free cell
+    showing the best action; clockwise order 0=N 1=NE 2=E 3=SE 4=S 5=SW 6=W 7=NW."""
+    res, ox, oy, start, goal = meta
+    qpath = os.path.join(ROS_DIR, 'maps', '{}_q_table.npy'.format(MAZE_NAME))
+    if not os.path.isfile(qpath):
+        print("Note: Q-table not found ({}), skipping policy plot".format(qpath))
+        return
+    q = np.load(qpath)
+    h, w = walls.shape
+
+    # Unit direction (dx, dy) for each action, in plotting coords (col, row).
+    # Row increases downward in the grid; we plot with row axis flipped, so a
+    # "north" move (row-1) points up (+ in plot y). Arrow vectors below are in
+    # (col_component, row_plot_component).
+    # clockwise: N, NE, E, SE, S, SW, W, NW
+    dirs = {
+        0: (0, 1), 1: (1, 1), 2: (1, 0), 3: (1, -1),
+        4: (0, -1), 5: (-1, -1), 6: (-1, 0), 7: (-1, 1),
+    }
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    ax.imshow(walls, cmap='Greys', origin='upper',
+              extent=[0, w, 0, h], alpha=0.85, aspect='equal')
+
+    for r in range(min(h, q.shape[0])):
+        for c in range(min(w, q.shape[1])):
+            if walls[r, c] == 1:
+                continue
+            if goal and (r, c) == tuple(goal):
+                ax.text(c + 0.5, h - r - 0.5, 'G', ha='center', va='center',
+                        fontsize=12, fontweight='bold', color='#1e8c3a')
+                continue
+            best = int(np.argmax(q[r, c]))
+            dx, dy = dirs[best]
+            # center of the cell in plot coords
+            cx = c + 0.5
+            cy = h - r - 0.5
+            ax.arrow(cx - dx * 0.18, cy - dy * 0.18, dx * 0.3, dy * 0.3,
+                     head_width=0.16, head_length=0.14,
+                     fc='#3b7dd8', ec='#3b7dd8', length_includes_head=True)
+
+    if start:
+        sr, sc = start
+        ax.text(sc + 0.5, h - sr - 0.5, 'S', ha='center', va='center',
+                fontsize=12, fontweight='bold', color='#d81e1e')
+
+    ax.set_xlim(0, w); ax.set_ylim(0, h)
+    ax.set_title('{}: base policy (no dynamic obstacles)'.format(MAZE_NAME))
+    ax.set_xlabel('column'); ax.set_ylabel('row')
+    fig.tight_layout()
+    p = os.path.join(OUT_DIR, 'policy_base_{}.png'.format(MAZE_NAME))
+    fig.savefig(p, dpi=130); plt.close(fig)
+    print("Wrote {}".format(p))
+
+
 def main():
     if not os.path.isfile(MAZE_CSV):
         print("Maze CSV not found: {}".format(MAZE_CSV)); return
@@ -405,6 +462,7 @@ def main():
     plot_replan_bars(data, present)
     plot_phys_vs_compute(data, present)
     plot_trajectories(data, walls, meta, present)
+    plot_base_policy(walls, meta)
     print("\nAll results saved to {}".format(OUT_DIR))
 
 
