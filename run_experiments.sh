@@ -38,7 +38,7 @@ MAZE_NAME="$1"
 MAX_OBS="$2"
 
 case "$MAZE_NAME" in
-    maze_02|maze_03|maze_06|maze_07) ;;
+    maze_02|maze_03|maze_06|maze_07|maze_08|maze_09) ;;
     *) echo "Error: maze must be one of maze_02 maze_03 maze_06 maze_07"; exit 1 ;;
 esac
 
