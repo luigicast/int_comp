@@ -111,10 +111,12 @@ def parse_log(path):
     if success and select_times:
         nav_time = float(goal_match.group(1)) - select_times[0]
     n_diag = sum(1 for (a, _) in actions if int(a) % 2 == 1)
+    detected_cells = set((int(r), int(c)) for (r, c) in confirmed)
     return {
         'success': success, 'nav_time': nav_time, 'n_steps': len(select_times),
         'n_replans': len(replan_ms), 'replan_ms': replan_ms,
         'n_obstacles': len(confirmed), 'n_diag': n_diag,
+        'detected_cells': detected_cells,
         'positions': positions, 'traj': [],
     }
 
@@ -156,6 +158,21 @@ def mean_std(values):
     arr = np.array(vals, dtype=float)
     s = float(arr.std(ddof=1)) if len(vals) > 1 else 0.0
     return (float(arr.mean()), s, len(vals))
+
+
+def full_stats(values):
+    """Return min, max, median, mean, sample std and count, ignoring None."""
+    vals = [v for v in values if v is not None]
+    if not vals:
+        nan = float('nan')
+        return {'min': nan, 'max': nan, 'median': nan, 'mean': nan, 'std': nan, 'n': 0}
+    arr = np.array(vals, dtype=float)
+    return {
+        'min': float(arr.min()), 'max': float(arr.max()),
+        'median': float(np.median(arr)), 'mean': float(arr.mean()),
+        'std': float(arr.std(ddof=1)) if len(vals) > 1 else 0.0,
+        'n': len(vals),
+    }
 
 
 def load_maze_walls(csv_path):
@@ -226,21 +243,62 @@ def write_report(data, meta, present_groups):
             out("  Increase vs 0 sets:     {:+.1f}%".format(100.0 * (t_m - base_time) / base_time))
         if prev_time is not None and not math.isnan(t_m):
             out("  Increase vs previous:   {:+.1f}%".format(100.0 * (t_m - prev_time) / prev_time))
+        # Extended stats for navigation time
+        ns = full_stats([r['nav_time'] for r in ok])
+        if ns['n'] > 0:
+            out("    min / median / max:   {:.1f} / {:.1f} / {:.1f} s".format(
+                ns['min'], ns['median'], ns['max']))
         out("  Steps (cells):          {:.1f} +/- {:.1f}".format(st_m, st_s))
         out("  Diagonal steps:         {:.1f} +/- {:.1f}".format(dg_m, dg_s))
         out("  Replanifications:       {:.1f} +/- {:.1f}".format(rp_m, rp_s))
         out("  Obstacle cells detected:{:.1f} +/- {:.1f}".format(ob_m, ob_s))
         if all_ms:
             out("  Compute per replan:     {:.1f} +/- {:.1f} ms".format(vi_m, vi_s))
+
+        # Per-run breakdown: navigation time of every individual run
+        out("  Per-run navigation time (s):")
+        out("    run:  " + "  ".join("{:>2d}".format(i) for i in range(1, n + 1)))
+        cells = []
+        for r in runs:
+            if r['success'] and r['nav_time'] is not None:
+                cells.append("{:5.1f}".format(r['nav_time']))
+            else:
+                cells.append("  X  ")   # failed / no time
+        out("    time: " + " ".join(cells))
+
         if base_time is None and not math.isnan(t_m):
             base_time = t_m
         if not math.isnan(t_m):
             prev_time = t_m
 
+    # ---- False-positive detection (0obs group only) ----------------------
+    # With no dynamic obstacles present, any replanification is triggered by a
+    # spurious detection (sensor projection phantom). Flag the runs where it
+    # happened so they are visible in the report.
+    if '0obs' in present_groups:
+        fp_runs = []
+        for i, r in enumerate(data['0obs'], 1):
+            if r['n_replans'] > 0:
+                cells = sorted(r['detected_cells'])
+                fp_runs.append((i, r['n_replans'], cells))
+        out("")
+        out("-" * 70)
+        out("  FALSE POSITIVES (0 sets group)")
+        if not fp_runs:
+            out("    None. No run replanned without obstacles present (clean).")
+        else:
+            out("    {}/{} runs replanned with NO obstacles present -> phantom".format(
+                len(fp_runs), len(data['0obs'])))
+            for run_i, nrep, cells in fp_runs:
+                out("      run {:02d}: {} replan(s), detected cell(s) {}".format(
+                    run_i, nrep, cells if cells else "(none logged)"))
+            out("    These are sensor-projection false positives (no real obstacle).")
+
     out("")
     out("  Units: navigation time in seconds (simulation clock); compute time in")
     out("  milliseconds (real wall clock); +/- is the sample standard deviation")
     out("  (N-1) across the 10 runs. Time/step metrics use successful runs only.")
+    out("  'X' in per-run times marks a run that did not reach the goal.")
     out("=" * 70)
 
     report = "\n".join(lines)
@@ -262,6 +320,36 @@ def write_csv(data, present_groups):
                             '' if r['nav_time'] is None else round(r['nav_time'], 2),
                             r['n_steps'], r['n_replans'], r['n_obstacles'],
                             r['n_diag'], '' if mrep == '' else round(mrep, 2)])
+    print("Wrote {}".format(path))
+
+
+def write_times_table(data, present_groups):
+    """Write a wide table of per-run navigation times: one row per run, one column
+    per obstacle group, plus Average and Std.Dev rows at the bottom. This mirrors
+    the reference layout (Run | 0 obstacles | 1 obstacle | 2 obstacles ...)."""
+    path = os.path.join(OUT_DIR, 'times_table_{}.csv'.format(MAZE_NAME))
+    n_runs = max(len(data[g]) for g in present_groups)
+    with open(path, 'w') as f:
+        w = csv.writer(f)
+        w.writerow(['Run'] + [GROUP_LABEL[g] for g in present_groups])
+        for i in range(n_runs):
+            row = [i + 1]
+            for g in present_groups:
+                runs = data[g]
+                if i < len(runs) and runs[i]['success'] and runs[i]['nav_time'] is not None:
+                    row.append(round(runs[i]['nav_time'], 3))
+                else:
+                    row.append('')   # failed / missing
+            w.writerow(row)
+        # Average and std rows (successful runs only)
+        avg = ['Average']; sd = ['Std.Dev']
+        for g in present_groups:
+            ok = [r['nav_time'] for r in data[g] if r['success'] and r['nav_time'] is not None]
+            m, s, _ = mean_std(ok)
+            avg.append('' if math.isnan(m) else round(m, 3))
+            sd.append('' if math.isnan(s) else round(s, 3))
+        w.writerow(avg)
+        w.writerow(sd)
     print("Wrote {}".format(path))
 
 
@@ -358,29 +446,45 @@ def plot_trajectories(data, walls, meta, present_groups):
             continue
         obstacles = load_obstacle_cells(g) or []
 
+        # Convert all runs once (reused by both plots)
+        converted = []
+        for r in runs:
+            cols, rows = _gz_to_plot(r['traj'], h, ox, oy, res)
+            converted.append((cols, rows))
+
+        # ---- Plot A: the 10 individual runs overlaid (no mean) ----
         fig, ax = plt.subplots(figsize=(7.5, 7.5))
         _draw_maze_background(ax, walls, obstacles, start, goal, h, w)
-
-        converted = []
-        for idx, r in enumerate(runs):
-            cols, rows = _gz_to_plot(r['traj'], h, ox, oy, res)
+        for idx, (cols, rows) in enumerate(converted):
             ax.plot(cols, rows, color=cmap(idx % 10), alpha=0.8, linewidth=1.6,
                     label='run {:02d}'.format(idx + 1))
-            converted.append((cols, rows))
+        ax.set_xlim(0, w); ax.set_ylim(0, h)
+        _row_axis_labels(ax, h, w)
+        ax.set_title('{} - {} ({} runs overlaid)'.format(MAZE_NAME, GROUP_LABEL[g], len(runs)))
+        ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=7)
+        ax.set_xlabel('column')
+        fig.tight_layout()
+        p = os.path.join(OUT_DIR, 'trajectories_{}_{}.png'.format(MAZE_NAME, g))
+        fig.savefig(p, dpi=130); plt.close(fig); print("Wrote {}".format(p))
+
+        # ---- Plot B: the mean path only ----
         L = min(len(c) for c, _ in converted)
         if L >= 2:
             mc = np.mean([np.interp(np.linspace(0, 1, L), np.linspace(0, 1, len(c)), c)
                           for c, _ in converted], axis=0)
             mr = np.mean([np.interp(np.linspace(0, 1, L), np.linspace(0, 1, len(rw)), rw)
                           for _, rw in converted], axis=0)
+            fig, ax = plt.subplots(figsize=(7.5, 7.5))
+            _draw_maze_background(ax, walls, obstacles, start, goal, h, w)
             ax.plot(mc, mr, color='black', linewidth=3.5, label='Mean path', zorder=10)
-        ax.set_xlim(0, w); ax.set_ylim(0, h)
-        ax.set_title('{} - {} ({} runs)'.format(MAZE_NAME, GROUP_LABEL[g], len(runs)))
-        ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=7)
-        ax.set_xlabel('column'); ax.set_ylabel('row')
-        fig.tight_layout()
-        p = os.path.join(OUT_DIR, 'trajectories_{}_{}.png'.format(MAZE_NAME, g))
-        fig.savefig(p, dpi=130); plt.close(fig); print("Wrote {}".format(p))
+            ax.set_xlim(0, w); ax.set_ylim(0, h)
+            _row_axis_labels(ax, h, w)
+            ax.set_title('{} - {} (mean path)'.format(MAZE_NAME, GROUP_LABEL[g]))
+            ax.legend(loc='center left', bbox_to_anchor=(1.0, 0.5), fontsize=8)
+            ax.set_xlabel('column')
+            fig.tight_layout()
+            p = os.path.join(OUT_DIR, 'trajectories_{}_{}_mean.png'.format(MAZE_NAME, g))
+            fig.savefig(p, dpi=130); plt.close(fig); print("Wrote {}".format(p))
 
         for i, r in enumerate(runs, 1):
             fig, ax = plt.subplots(figsize=(6.5, 6.5))
@@ -393,6 +497,7 @@ def plot_trajectories(data, walls, meta, present_groups):
                 ax.plot(cols[-1], rows[-1], '*', color=color, markersize=14,
                         label='goal' if r['success'] else 'end (fail)')
             ax.set_xlim(0, w); ax.set_ylim(0, h)
+            _row_axis_labels(ax, h, w)
             status = 'OK' if r['success'] else 'FAIL'
             ax.set_title('{} {} run {:02d} [{}]'.format(MAZE_NAME, GROUP_LABEL[g], i, status))
             ax.legend(loc='upper right', fontsize=8)
@@ -400,6 +505,20 @@ def plot_trajectories(data, walls, meta, present_groups):
             p = os.path.join(indiv_dir, '{}_{}_run{:02d}.png'.format(MAZE_NAME, g, i))
             fig.savefig(p, dpi=110); plt.close(fig)
         print("Wrote {} individual plots for {}".format(len(runs), g))
+
+
+def _row_axis_labels(ax, h, w=None):
+    """Relabel the Y axis so it reads as CSV rows: row 0 at the top, increasing
+    downward. Shows every row tick (0..h-1), and every column tick too, so each
+    cell is directly identifiable. Only tick LABELS change, not the drawing, so
+    trajectories and walls stay exactly as plotted. Plot y-value Y = CSV row (h-Y)."""
+    yticks = list(range(0, h + 1))
+    ax.set_yticks(yticks)
+    ax.set_yticklabels([str(h - t) for t in yticks])
+    ax.set_ylabel('row (CSV order: 0 at top)')
+    if w is not None:
+        ax.set_xticks(list(range(0, w + 1)))
+        ax.set_xticklabels([str(c) for c in range(0, w + 1)])
 
 
 def _draw_maze_background(ax, walls, obstacles, start, goal, h, w):
@@ -481,6 +600,7 @@ def plot_base_policy(walls, meta):
                 fontsize=12, fontweight='bold', color='#d81e1e')
 
     ax.set_xlim(0, w); ax.set_ylim(0, h)
+    _row_axis_labels(ax, h, w)
     ax.set_title('{}: base policy (no dynamic obstacles)'.format(MAZE_NAME))
     ax.set_xlabel('column'); ax.set_ylabel('row')
     fig.tight_layout()
@@ -503,6 +623,7 @@ def main():
 
     write_report(data, meta, present)
     write_csv(data, present)
+    write_times_table(data, present)
     plot_time_bars(data, present)
     plot_replan_bars(data, present)
     plot_phys_vs_compute(data, present)
