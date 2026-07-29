@@ -7,26 +7,31 @@ The world is offset so that the start cell is centered at Gazebo origin (0, 0).
 The robot spawns at the start position automatically with no x_pos/y_pos needed.
 
 Usage:
-    python ~/csv_to_ros_map.py <file.csv> [resolution] --start row col --goal row col
+    python ~/csv_to_ros_map.py <file.csv> [resolution] --start row col --goal row col [--dynamic obs.json]
 
     resolution: meters per cell (default: 0.5)
     --start row col: spawn cell in grid coordinates (required)
     --goal  row col: goal cell in grid coordinates (required)
+    --dynamic obs.json: optional JSON with dynamic obstacle cells (test only, orange in Gazebo)
 
 Output:
     ~/ros_mazes/maps/<name>.pgm + <name>.yaml   -> ROS map_server / AMCL
     ~/ros_mazes/worlds/<name>.world             -> Gazebo physical world
     ~/ros_mazes/maps/<name>.json                -> start/goal metadata
 
+Dynamic obstacles JSON format:
+    {"obstacles": [[row, col], [row, col], ...]}
+
 Example:
-    python ~/csv_to_ros_map.py ~/ros_mazes/csv/maze_01.csv 0.5 --start 7 1 --goal 3 7
+    python ~/csv_to_ros_map.py ~/ros_mazes/csv/maze_07.csv 0.5 --start 6 4 --goal 6 7
+    python ~/csv_to_ros_map.py ~/ros_mazes/csv/maze_07.csv 0.5 --start 6 4 --goal 6 7 --dynamic ~/ros_mazes/csv/maze_07_dynamic.json
 
 Load in Gazebo (robot spawns at start automatically):
-    export TURTLEBOT_GAZEBO_WORLD_FILE=~/ros_mazes/worlds/maze_01.world
+    export TURTLEBOT_GAZEBO_WORLD_FILE=~/ros_mazes/worlds/maze_07.world
     roslaunch turtlebot_gazebo turtlebot_world.launch
 
 Load in ROS:
-    rosrun map_server map_server ~/ros_mazes/maps/maze_01.yaml
+    rosrun map_server map_server ~/ros_mazes/maps/maze_07.yaml
 """
 
 import csv
@@ -56,6 +61,14 @@ def read_csv(path):
             raise ValueError("Row {} has {} cells, expected {}.".format(i, len(row), width))
     return grid
 
+def load_dynamic_obstacles(path):
+    """Load dynamic obstacle cells from a JSON file.
+    Expected format: {"obstacles": [[row, col], [row, col], ...]}
+    Returns a list of (row, col) tuples.
+    """
+    with open(path, 'r') as f:
+        data = json.load(f)
+    return [tuple(cell) for cell in data.get('obstacles', [])]
 
 def cell_to_gazebo(row, col, grid_height, resolution, offset_x, offset_y):
     """Convert grid (row, col) to Gazebo (x, y) with offset so start = (0, 0)."""
@@ -101,9 +114,9 @@ def write_yaml(pgm_path, yaml_path, resolution):
 
 def write_json(json_path, resolution, offset_x, offset_y, start_gz, goal_gz, start_cell, goal_cell):
     data = {
-	"resolution": resolution,
-	"offset_x": offset_x,
-	"offset_y": offset_y,
+        "resolution": resolution,
+        "offset_x": offset_x,
+        "offset_y": offset_y,
         "start": {"cell": list(start_cell), "gazebo": list(start_gz)},
         "goal":  {"cell": list(goal_cell),  "gazebo": list(goal_gz)}
     }
@@ -112,10 +125,22 @@ def write_json(json_path, resolution, offset_x, offset_y, start_gz, goal_gz, sta
     print("  [OK] JSON: {}".format(json_path))
 
 
-def write_world(grid, world_path, resolution, offset_x, offset_y):
+def write_world(grid, world_path, resolution, offset_x, offset_y, dynamic_obstacles, goal_cell=None):
+    """Generate Gazebo .world file.
+    Static walls: red/dark (0.6 0.15 0.15)
+    Dynamic obstacles: orange (0.9 0.5 0.1) -- physically present but meant to be detected by LiDAR
+    Dynamic obstacles are NOT in the CSV, only placed here for --test worlds.
+    Goal marker: blue flat tile, no collision (visual only, robot passes through).
+    """
+    if dynamic_obstacles is None:
+        dynamic_obstacles = []
+
     h = len(grid)
     models = ''
-    count = 0
+    wall_count = 0
+    dyn_count = 0
+
+    # --- Static walls from CSV ---
     for r, row in enumerate(grid):
         for c, cell in enumerate(row):
             if cell == 1:
@@ -130,21 +155,68 @@ def write_world(grid, world_path, resolution, offset_x, offset_y):
         <collision name='col'><geometry><box><size>{s} {s} {wh}</size></box></geometry></collision>
         <visual name='vis'>
           <geometry><box><size>{s} {s} {wh}</size></box></geometry>
-          <material><script>
-            <uri>file://media/materials/scripts/gazebo.material</uri>
-            <name>Gazebo/Grey</name>
-          </script></material>
+          <material>
+            <ambient>0.6 0.15 0.15 1.0</ambient>
+            <diffuse>0.6 0.15 0.15 1.0</diffuse>
+            <specular>0.1 0.1 0.1 1.0</specular>
+          </material>
         </visual>
       </link>
-    </model>""".format(id=count, x=x, y=y, z=z, s=s, wh=WALL_HEIGHT)
-                count += 1
+    </model>""".format(id=wall_count, x=x, y=y, z=z, s=s, wh=WALL_HEIGHT)
+                wall_count += 1
+
+    # --- Dynamic obstacles: orange boxes, same size, physically solid for LiDAR ---
+    for (r, c) in dynamic_obstacles:
+        x, y = cell_to_gazebo(r, c, h, resolution, offset_x, offset_y)
+        z = round(WALL_HEIGHT / 2.0, 4)
+        s = round(resolution, 4)
+        models += """
+    <model name='dynamic_obs_{id}'>
+      <static>1</static>
+      <pose>{x} {y} {z} 0 0 0</pose>
+      <link name='link'>
+        <collision name='col'><geometry><box><size>{s} {s} {wh}</size></box></geometry></collision>
+        <visual name='vis'>
+          <geometry><box><size>{s} {s} {wh}</size></box></geometry>
+          <material>
+            <ambient>0.9 0.5 0.1 1.0</ambient>
+            <diffuse>0.9 0.5 0.1 1.0</diffuse>
+            <specular>0.2 0.2 0.1 1.0</specular>
+          </material>
+        </visual>
+      </link>
+    </model>""".format(id=dyn_count, x=x, y=y, z=z, s=s, wh=WALL_HEIGHT)
+        dyn_count += 1
+
+    if goal_cell is not None:
+        gr, gc = goal_cell
+        x, y = cell_to_gazebo(gr, gc, h, resolution, offset_x, offset_y)
+        s = round(resolution * 0.9, 4)   # slightly smaller than a cell
+        thickness = 0.02                  # very thin, lies flat on the ground
+        z = round(thickness / 2.0, 4)
+        models += """
+    <model name='goal_marker'>
+      <static>1</static>
+      <pose>{x} {y} {z} 0 0 0</pose>
+      <link name='link'>
+        <visual name='vis'>
+          <geometry><box><size>{s} {s} {t}</size></box></geometry>
+          <material>
+            <ambient>0.1 0.3 0.9 1.0</ambient>
+            <diffuse>0.1 0.3 0.9 1.0</diffuse>
+            <specular>0.1 0.1 0.2 1.0</specular>
+          </material>
+        </visual>
+      </link>
+    </model>""".format(x=x, y=y, z=z, s=s, t=thickness)
 
     with open(world_path, 'w') as f:
         f.write("""<?xml version="1.0" ?>
 <sdf version="1.5">
-  <world name="maze_world">
-    <include><uri>model://ground_plane</uri></include>
+  <world name="default">
+    <!-- Standard sun and ground plane, required for depth sensor ray casting -->
     <include><uri>model://sun</uri></include>
+    <include><uri>model://ground_plane</uri></include>
     <physics type="ode">
       <real_time_update_rate>1000.0</real_time_update_rate>
       <max_step_size>0.001</max_step_size>
@@ -154,7 +226,8 @@ def write_world(grid, world_path, resolution, offset_x, offset_y):
   </world>
 </sdf>
 """.format(models=models))
-    print("  [OK] World: {} ({} walls)".format(world_path, count))
+    print(" [OK] World: {} ({} walls, {} dynamic obstacles)".format(world_path, wall_count, dyn_count))
+
 
 
 def parse_args(argv):
@@ -163,6 +236,7 @@ def parse_args(argv):
     resolution = 0.5
     start_cell = None
     goal_cell = None
+    dynamic_path = None
 
     i = 1
     while i < len(argv):
@@ -172,6 +246,9 @@ def parse_args(argv):
         elif argv[i] == '--goal':
             goal_cell = (int(argv[i+1]), int(argv[i+2]))
             i += 3
+        elif argv[i] == '--dynamic':
+            dynamic_path = os.path.expanduser(argv[i+1])
+            i += 2
         elif csv_path is None:
             csv_path = argv[i]
             i += 1
@@ -179,7 +256,7 @@ def parse_args(argv):
             resolution = float(argv[i])
             i += 1
 
-    return csv_path, resolution, start_cell, goal_cell
+    return csv_path, resolution, start_cell, goal_cell, dynamic_path
 
 
 def main():
@@ -187,7 +264,7 @@ def main():
         print(__doc__)
         sys.exit(1)
 
-    csv_path, resolution, start_cell, goal_cell = parse_args(sys.argv)
+    csv_path, resolution, start_cell, goal_cell, dynamic_path = parse_args(sys.argv)
     csv_path = os.path.expanduser(csv_path)
 
     if not os.path.isfile(csv_path):
@@ -219,12 +296,21 @@ def main():
     offset_x = start_cell[1] * resolution + resolution / 2.0
     offset_y = (h - start_cell[0] - 1) * resolution + resolution / 2.0
 
+    # Load dynamic obstacles if provided
+    dynamic_obstacles = []
+    if dynamic_path:
+        if not os.path.isfile(dynamic_path):
+            print("Error: dynamic obstacles file not found: {}".format(dynamic_path))
+            sys.exit(1)
+        dynamic_obstacles = load_dynamic_obstacles(dynamic_path)
+        print("      Dynamic obstacles: {} cells loaded from {}".format(len(dynamic_obstacles), dynamic_path))
+
     print("\n[2/3] Generating ROS map (PGM + YAML)...")
     write_pgm(grid, pgm_path)
     write_yaml(pgm_path, yaml_path, resolution)
 
     print("\n[3/3] Generating Gazebo world...")
-    write_world(grid, world_path, resolution, offset_x, offset_y)
+    write_world(grid, world_path, resolution, offset_x, offset_y, dynamic_obstacles, goal_cell)
 
     goal_gz = cell_to_gazebo(goal_cell[0], goal_cell[1], h, resolution, offset_x, offset_y)
     write_json(json_path, resolution, offset_x, offset_y, (0.0, 0.0), goal_gz, start_cell, goal_cell)
